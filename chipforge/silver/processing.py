@@ -9,6 +9,28 @@ from .validation import validate_run, score_quality
 DATASETS = ("runs", "run_configurations", "run_artifacts", "metric_observations", "timing_paths", "cell_statistics", "violations", "validation_results", "run_quality")
 MANDATORY = {"run_configuration", "timing_summary", "sta_setup", "area_report", "cell_statistics"}
 
+def normalize_timestamp_fields(rows, spark_schema):
+    """Convert schema-declared timestamp values to naive UTC datetimes for Spark."""
+    timestamp_fields = {
+        field.name for field in spark_schema.fields
+        if field.dataType.typeName().lower() == "timestamp"
+    }
+    normalized = []
+    for row in rows:
+        converted = dict(row)
+        for name in timestamp_fields:
+            value = converted.get(name)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                # datetime.fromisoformat on older Python versions does not accept Z.
+                value = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+            if isinstance(value, datetime) and value.tzinfo is not None:
+                value = value.astimezone(timezone.utc).replace(tzinfo=None)
+            converted[name] = value
+        normalized.append(converted)
+    return normalized
+
 def discover_run(run_dir: Path):
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     files = {str(p.relative_to(run_dir)).replace("\\", "/") for p in run_dir.rglob("*") if p.is_file() and p.name != "manifest.json"}
@@ -62,6 +84,7 @@ def write_silver(spark, records: list[dict[str, Any]], output_uri: str, overwrit
     for dataset in DATASETS:
         rows = records.get(dataset, [])
         if not rows: continue
+        rows = normalize_timestamp_fields(rows, SCHEMAS[dataset])
         frame = spark.createDataFrame(rows, schema=SCHEMAS[dataset])
         path = f"{output_uri.rstrip('/')}/{dataset}"
         if not overwrite:
