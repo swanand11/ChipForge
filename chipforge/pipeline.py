@@ -20,11 +20,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--silver", action="store_true", help="process existing raw artifacts to Silver Parquet")
     parser.add_argument("--silver-output", default="data/silver", help="Silver Parquet output URI (supports s3a://)")
     parser.add_argument("--overwrite-silver", action="store_true", help="replace existing Silver run data")
+    parser.add_argument("--hadoop-aws-version", help="Hadoop version for matching hadoop-aws S3A connector")
+    parser.add_argument("--spark-log-level", default="WARN", help="Spark log level for Silver processing")
     args = parser.parse_args(argv)
     if args.silver:
         silver_args = ["--input", str(args.output / "runs"), "--output", args.silver_output]
         if args.overwrite_silver:
             silver_args.append("--overwrite")
+        if args.hadoop_aws_version:
+            silver_args.extend(["--hadoop-aws-version", args.hadoop_aws_version])
+        silver_args.extend(["--spark-log-level", args.spark_log_level])
         return silver_main(silver_args)
     if args.runs <= 0:
         parser.error("--runs must be positive")

@@ -71,12 +71,15 @@ def process_run(run_dir: Path, registry=DEFAULT_REGISTRY, tolerances=None):
     return {"runs":runs,"run_configurations":config,"run_artifacts":artifacts,"metric_observations":metrics,
         "timing_paths":paths,"cell_statistics":cells,"violations":violations,"validation_results":validations,"run_quality":[quality],"audit":audits}
 
-def create_spark(app_name="ChipForgeBronzeToSilver"):
+def create_spark(app_name="ChipForgeBronzeToSilver", spark_packages=None):
     try:
         from pyspark.sql import SparkSession
     except ImportError as exc:
         raise RuntimeError("PySpark is required to write Silver Parquet datasets; install pyspark in the processing environment") from exc
-    return SparkSession.builder.appName(app_name).getOrCreate()
+    builder = SparkSession.builder.appName(app_name)
+    if spark_packages:
+        builder = builder.config("spark.jars.packages", ",".join(spark_packages))
+    return builder.getOrCreate()
 
 def write_silver(spark, records: list[dict[str, Any]], output_uri: str, overwrite=False):
     """Write explicit-schema Parquet. Existing run partitions are preserved by default."""
@@ -118,6 +121,8 @@ def main(argv=None):
     ap=argparse.ArgumentParser(description="Parse ChipForge Bronze reports and write Silver Parquet")
     ap.add_argument("--input",type=Path,default=Path("data/raw/runs")); ap.add_argument("--output",default="data/silver"); ap.add_argument("--overwrite",action="store_true")
     ap.add_argument("--tolerance",action="append",default=[],help="NAME=FLOAT validation tolerance")
+    ap.add_argument("--hadoop-aws-version", help="Load org.apache.hadoop:hadoop-aws at this exact Hadoop runtime version for S3A")
+    ap.add_argument("--spark-log-level", default="WARN", help="Spark driver/executor log level (default: WARN)")
     args=ap.parse_args(argv); tolerances={}
     for item in args.tolerance:
         name,value=item.split("=",1); tolerances[name]=float(value)
@@ -128,7 +133,9 @@ def main(argv=None):
     combined={dataset:[] for dataset in DATASETS}; combined["audit"]=[]
     for batch in batches:
         for name,rows in batch.items(): combined.setdefault(name,[]).extend(rows)
-    spark=create_spark()
+    packages = ["org.apache.hadoop:hadoop-aws:" + args.hadoop_aws_version] if args.hadoop_aws_version else None
+    spark=create_spark(spark_packages=packages)
+    spark.sparkContext.setLogLevel(args.spark_log_level)
     audit_uri = args.output
     if not audit_uri.startswith(("s3a://", "s3://", "file://")):
         audit_uri = str(Path(audit_uri) / "_audit")
