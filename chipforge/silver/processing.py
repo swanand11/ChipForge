@@ -139,6 +139,23 @@ def normalize_rows_for_schema(rows, spark_schema, dataset):
             raise type(exc)(f"{dataset} row {row_index}: {exc}") from exc
     return normalized_rows
 
+def normalize_audit_rows(rows, audit_schema=None):
+    """Normalize the existing processing audit fields to their explicit Spark schema."""
+    if audit_schema is None:
+        from .schemas import AUDIT_SCHEMA
+        audit_schema = AUDIT_SCHEMA
+    prepared = []
+    boolean_fields = {field.name for field in audit_schema.fields
+                      if field.dataType.typeName().lower() == "boolean"}
+    for row_index, row in enumerate(rows):
+        normalized = dict(row)
+        for name in boolean_fields:
+            value = normalized.get(name)
+            if isinstance(value, int) and not isinstance(value, bool) and value in (0, 1):
+                normalized[name] = bool(value)
+        prepared.append(normalized)
+    return normalize_rows_for_schema(prepared, audit_schema, "processing_audit")
+
 def discover_run(run_dir: Path):
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     files = {str(p.relative_to(run_dir)).replace("\\", "/") for p in run_dir.rglob("*") if p.is_file() and p.name != "manifest.json"}
@@ -218,15 +235,23 @@ def write_silver(spark, records: list[dict[str, Any]], output_uri: str, overwrit
 def write_audit(records, uri, spark=None):
     """Write JSON audit locally or append JSON via Spark to an S3A-compatible URI."""
     rows = records.get("audit", [])
-    if not rows: return
+    from .schemas import AUDIT_SCHEMA
+    normalized_rows = normalize_audit_rows(rows, AUDIT_SCHEMA)
     if uri.startswith("s3a://"):
         if spark is None: raise RuntimeError("Spark session is required for S3A audit writes")
-        spark.createDataFrame(rows).write.mode("append").json(uri.rstrip("/") + "/processing_audit")
+        spark.createDataFrame(normalized_rows, schema=AUDIT_SCHEMA).write.mode("append").json(uri.rstrip("/") + "/processing_audit")
     else:
         path=Path(uri); path.mkdir(parents=True, exist_ok=True)
         target=path / "processing_audit.jsonl"
         with target.open("a",encoding="utf-8") as f:
-            for row in rows: f.write(json.dumps(row,default=str)+"\n")
+            for row in normalized_rows: f.write(json.dumps(row,default=_audit_json_default)+"\n")
+
+def _audit_json_default(value):
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.isoformat() + "Z"
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return str(value)
 
 def main(argv=None):
     ap=argparse.ArgumentParser(description="Parse ChipForge Bronze reports and write Silver Parquet")
