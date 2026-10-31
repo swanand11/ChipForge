@@ -35,6 +35,110 @@ def normalize_timestamp_fields(rows, spark_schema):
         normalized.append(converted)
     return normalized
 
+def _normalize_value(value, data_type, path, nullable=True):
+    """Normalize a value recursively according to a Spark SQL datatype."""
+    if value is None:
+        if not nullable:
+            raise ValueError(f"{path}: null is not allowed by the schema")
+        return None
+
+    type_name = data_type.typeName().lower()
+    if type_name == "double":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{path}: expected a number for DoubleType, got {value!r} ({type(value).__name__})")
+        return float(value)
+    if type_name in {"byte", "short", "integer", "long"}:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{path}: expected an integer for {data_type.simpleString()}, got {value!r} ({type(value).__name__})")
+        return value
+    if type_name == "float":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{path}: expected a number for FloatType, got {value!r} ({type(value).__name__})")
+        return float(value)
+    if type_name == "string":
+        if not isinstance(value, str):
+            raise TypeError(f"{path}: expected str for StringType, got {value!r} ({type(value).__name__})")
+        return value
+    if type_name == "boolean":
+        if not isinstance(value, bool):
+            raise TypeError(f"{path}: expected bool for BooleanType, got {value!r} ({type(value).__name__})")
+        return value
+    if type_name == "timestamp":
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+        if not isinstance(value, datetime):
+            raise TypeError(f"{path}: expected ISO timestamp or datetime, got {value!r} ({type(value).__name__})")
+        return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo is not None else value
+    if type_name == "date":
+        from datetime import date
+        if isinstance(value, datetime) or not isinstance(value, date):
+            raise TypeError(f"{path}: expected date, got {value!r} ({type(value).__name__})")
+        return value
+    if type_name == "decimal":
+        from decimal import Decimal
+        if not isinstance(value, Decimal):
+            try:
+                value = Decimal(str(value))
+            except Exception as exc:
+                raise TypeError(f"{path}: cannot convert {value!r} to DecimalType") from exc
+        return value
+    if type_name == "binary":
+        if not isinstance(value, (bytes, bytearray)):
+            raise TypeError(f"{path}: expected bytes for BinaryType, got {value!r} ({type(value).__name__})")
+        return bytes(value)
+    if type_name == "array":
+        if not isinstance(value, (list, tuple)):
+            raise TypeError(f"{path}: expected list/tuple for ArrayType, got {value!r} ({type(value).__name__})")
+        return [_normalize_value(item, data_type.elementType, f"{path}[{index}]", data_type.containsNull)
+                for index, item in enumerate(value)]
+    if type_name == "map":
+        if not isinstance(value, dict):
+            raise TypeError(f"{path}: expected dict for MapType, got {value!r} ({type(value).__name__})")
+        normalized = {}
+        for key, item in value.items():
+            normalized_key = _normalize_value(key, data_type.keyType, f"{path}.<key>", False)
+            normalized[normalized_key] = _normalize_value(item, data_type.valueType,
+                f"{path}[{key!r}]", data_type.valueContainsNull)
+        return normalized
+    if type_name == "struct":
+        if hasattr(value, "asDict"):
+            value = value.asDict(recursive=False)
+        if isinstance(value, dict):
+            normalized = {}
+            for field in data_type.fields:
+                field_value = value.get(field.name)
+                normalized[field.name] = _normalize_value(field_value, field.dataType,
+                    f"{path}.{field.name}", field.nullable)
+            return normalized
+        if isinstance(value, (list, tuple)):
+            if len(value) != len(data_type.fields):
+                raise TypeError(f"{path}: expected {len(data_type.fields)} struct values, got {len(value)}")
+            return tuple(_normalize_value(item, field.dataType, f"{path}.{field.name}", field.nullable)
+                         for item, field in zip(value, data_type.fields))
+        raise TypeError(f"{path}: expected dict/Row/tuple for StructType, got {value!r} ({type(value).__name__})")
+    if type_name == "null":
+        raise TypeError(f"{path}: expected null for NullType, got {value!r} ({type(value).__name__})")
+    # Keep additional Spark SQL types intact; Spark's schema validation remains authoritative.
+    return value
+
+def normalize_rows_for_schema(rows, spark_schema, dataset):
+    """Apply schema-guided normalization to rows, including nested Spark types."""
+    normalized_rows = []
+    for row_index, row in enumerate(rows):
+        try:
+            if not isinstance(row, dict):
+                raise TypeError(f"expected a dict row, got {row!r} ({type(row).__name__})")
+            normalized = dict(row)
+            for field in spark_schema.fields:
+                value = row.get(field.name)
+                normalized[field.name] = _normalize_value(
+                    value, field.dataType, f"{dataset}.{field.name}[row {row_index}]", field.nullable
+                )
+            normalized_rows.append(normalized)
+        except (TypeError, ValueError) as exc:
+            raise type(exc)(f"{dataset} row {row_index}: {exc}") from exc
+    return normalized_rows
+
 def discover_run(run_dir: Path):
     manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
     files = {str(p.relative_to(run_dir)).replace("\\", "/") for p in run_dir.rglob("*") if p.is_file() and p.name != "manifest.json"}
@@ -91,8 +195,11 @@ def write_silver(spark, records: list[dict[str, Any]], output_uri: str, overwrit
     for dataset in DATASETS:
         rows = records.get(dataset, [])
         if not rows: continue
-        rows = normalize_timestamp_fields(rows, SCHEMAS[dataset])
-        frame = spark.createDataFrame(rows, schema=SCHEMAS[dataset])
+        rows = normalize_rows_for_schema(rows, SCHEMAS[dataset], dataset)
+        try:
+            frame = spark.createDataFrame(rows, schema=SCHEMAS[dataset])
+        except Exception as exc:
+            raise TypeError(f"Spark rejected normalized rows for Silver dataset {dataset}: {exc}") from exc
         path = f"{output_uri.rstrip('/')}/{dataset}"
         if not overwrite:
             # Processing is run-id incremental. Refuse to silently rewrite IDs already present.
