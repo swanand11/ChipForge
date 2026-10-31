@@ -8,6 +8,10 @@ from .parsers import DEFAULT_REGISTRY, ParseContext
 from .validation import validate_run, score_quality
 DATASETS = ("runs", "run_configurations", "run_artifacts", "metric_observations", "timing_paths", "cell_statistics", "violations", "validation_results", "run_quality")
 MANDATORY = {"run_configuration", "timing_summary", "sta_setup", "area_report", "cell_statistics"}
+S3A_SPARK_PACKAGES = (
+    "org.apache.hadoop:hadoop-aws:3.3.4",
+    "com.amazonaws:aws-java-sdk-bundle:1.12.262",
+)
 
 def normalize_timestamp_fields(rows, spark_schema):
     """Convert schema-declared timestamp values to naive UTC datetimes for Spark."""
@@ -121,7 +125,6 @@ def main(argv=None):
     ap=argparse.ArgumentParser(description="Parse ChipForge Bronze reports and write Silver Parquet")
     ap.add_argument("--input",type=Path,default=Path("data/raw/runs")); ap.add_argument("--output",default="data/silver"); ap.add_argument("--overwrite",action="store_true")
     ap.add_argument("--tolerance",action="append",default=[],help="NAME=FLOAT validation tolerance")
-    ap.add_argument("--hadoop-aws-version", help="Load org.apache.hadoop:hadoop-aws at this exact Hadoop runtime version for S3A")
     ap.add_argument("--spark-log-level", default="WARN", help="Spark driver/executor log level (default: WARN)")
     args=ap.parse_args(argv); tolerances={}
     for item in args.tolerance:
@@ -133,7 +136,7 @@ def main(argv=None):
     combined={dataset:[] for dataset in DATASETS}; combined["audit"]=[]
     for batch in batches:
         for name,rows in batch.items(): combined.setdefault(name,[]).extend(rows)
-    packages = ["org.apache.hadoop:hadoop-aws:" + args.hadoop_aws_version] if args.hadoop_aws_version else None
+    packages = list(S3A_SPARK_PACKAGES)
     spark=create_spark(spark_packages=packages)
     spark.sparkContext.setLogLevel(args.spark_log_level)
     audit_uri = args.output
